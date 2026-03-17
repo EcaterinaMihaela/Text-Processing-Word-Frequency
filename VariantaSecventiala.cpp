@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <sstream>
 #include <cctype>
+#include <chrono> // timpi rulare
 
 using namespace std;
+using namespace std::chrono;
 
 //functie pentru normalizare cuvant
 string normalize(const string& word)
@@ -31,7 +33,7 @@ bool cmp(const pair<string, int>& a, const pair<string, int>& b)
 int main()
 {
 
-    ifstream file("D:/ADP/ProiectAPD/VariantaSecventiala/Alice_in_Wonderland.txt");
+    ifstream file("D:/ADP/ProiectAPD/VariantaSecventiala/Alice_in_Wonderland_chapter1.txt");
 
     if (!file)
     {
@@ -46,6 +48,10 @@ int main()
         cout << "Fisierul este gol!\n";
         return 1;
     }
+
+    // pornim masurarea timpului
+    auto start = high_resolution_clock::now();
+
     //citire cuvinte
     while (file >> word)
     {
@@ -61,6 +67,10 @@ int main()
     //sortare desc vector perechi dupa frecv
     sort(words.begin(), words.end(), cmp);
 
+    auto end = high_resolution_clock::now(); // sfarsit timp
+    // calculam durata in milisecunde
+    auto duration = duration_cast<milliseconds>(end - start);
+
     int N = 10;
 
     cout << "Cele mai frecvente " << N << " cuvinte:\n";
@@ -69,6 +79,7 @@ int main()
     {
         cout << words[i].first << " : " << words[i].second << endl;
     }
+    cout << "\nTimp total de procesare: " << duration.count() << " ms\n";
 
     file.close();
     return 0;
