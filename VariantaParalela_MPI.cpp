@@ -1,234 +1,215 @@
 #include <mpi.h>
 #include <iostream>
-#include <fstream>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
-#include <sstream>
 #include <cctype>
+#include <string>
 
 using namespace std;
 
-// normalizare cuvant
-string normalize(const string& word)
-{
-    string result;
-    for (unsigned char c : word)
-    {
-        if (isalpha(c))
-            result += tolower(c);
+//// transforma un caracter in litera mica sau returneaza '\0' daca nu e litera
+inline char normalize_char(char c) {
+    if (isalpha((unsigned char)c))
+        return tolower((unsigned char)c);
+    return '\0';
+}
+
+/// adauga cuvantul curent in map si il reseteaza
+void add_word(unordered_map<string, int>& freq, string& word) {
+    if (!word.empty()) {
+        freq[word]++;
+        word.clear();
     }
-    return result;
 }
 
-// comparator
-bool cmp(const pair<string, int>& a, const pair<string, int>& b)
-{
-    return a.second > b.second;
-}
-
-int main(int argc, char* argv[])
-{
+int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
 
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    vector<string> allWords;
+    MPI_File file;
+    const char* filename = "D:/ADP/ProiectAPD/VariantaSecventiala/Alice_in_Wonderland_x30mb.txt";
 
-	MPI_Barrier(MPI_COMM_WORLD);
-	double start = MPI_Wtime();
+    MPI_Barrier(MPI_COMM_WORLD);
+    double start = MPI_Wtime();
 
-    //doar rank 0 citeste
-    if (rank == 0)
-    {
-        ifstream file("D:/ADP/ProiectAPD/VariantaSecventiala/Alice_in_Wonderland_x100.txt");
+    //// deschidem fisierul in mod doar citire, toti procesii il acceseaza in paralel
+    MPI_File_open(MPI_COMM_WORLD, filename,
+        MPI_MODE_RDONLY, MPI_INFO_NULL, &file);
 
-        if (!file)
-        {
-            cout << "Eroare fisier\n";
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
+    //// aflam dimensiunea totala a fisierului
+    MPI_Offset file_size;
+    MPI_File_get_size(file, &file_size);
 
-        string word;
-        while (file >> word)
-        {
-            word = normalize(word);
-            if (!word.empty())
-                allWords.push_back(word);
-        }
+    // impartim fisierul in chunk-uri egale, cate unul per proces
+    MPI_Offset chunk = file_size / size;
+    // fiecare proces isi calculeaza offsetul de start
+    MPI_Offset read_start = rank * chunk;
+    // ultimul proces ia si restul ramas din impartire
+    MPI_Offset read_end = (rank == size - 1) ? file_size : read_start + chunk;
+
+    // Citim 200bytes la dreapta ca sa detectam
+    // daca ultimul cuvant al chunk e complet sau taiat
+    const MPI_Offset EXTRA = 200;
+    MPI_Offset actual_read_end = (rank == size - 1)
+        ? file_size
+        : min(file_size, read_end + EXTRA);
+
+    MPI_Offset read_size = actual_read_end - read_start;
+    vector<char> buffer(read_size);
+
+
+    // fiecare proces citeste chunk-ul sau direct din fisier, in paralel
+    MPI_File_read_at_all(file, read_start, buffer.data(),
+        (int)read_size, MPI_CHAR, MPI_STATUS_IGNORE);
+    MPI_File_close(&file);
+
+   
+    // CALCULARE START_IDX
+    // daca nu suntem primul proces, e posibil ca buffer-ul
+    // sa inceapa in mijlocul unui cuvant care apartine procesului anterior
+    // il sarim ca sa nu il numaram de doua ori
+   
+    size_t start_idx = 0;
+
+    if (rank != 0) {
+        // sarim literele ramase din cuvantul anterior
+        while (start_idx < (size_t)read_size && isalpha((unsigned char)buffer[start_idx]))
+            start_idx++;
+        // sarim separatorii pana la primul cuvant complet al nostru
+        while (start_idx < (size_t)read_size && !isalpha((unsigned char)buffer[start_idx]))
+            start_idx++;
+        // Acum start_idx pointează la primul cuvânt COMPLET al acestui proces
     }
 
-    // trimite numarul total de cuvinte
-    int total_words = allWords.size();
-    MPI_Bcast(&total_words, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    // CALCULARE END_IDX
+    // daca nu suntem ultimul proces, trebuie sa stabilim unde se termina
+    // chunk-ul nostru, avand grija sa nu taiem un cuvant la jumatate
+    size_t end_idx = (size_t)read_size; // default: tot buffer-ul (rank == size-1)
 
-    vector<int> sendcounts(size), displs(size);  //cat primeste fiecare proces si de unde incepe fiecare bucata
+    if (rank != size - 1) {
+        // granita logica a chunk-ului in interiorul buffer-ului
+        size_t boundary = (size_t)(read_end - read_start);
 
-    //impartire
-    int base = total_words / size;
-    int remainder = total_words % size;
-
-    //pt fiec proces :ia bucata asta incepand de aici
-    int offset = 0;
-    for (int i = 0; i < size; i++)
-    {
-        sendcounts[i] = base + (i < remainder ? 1 : 0); //unele procese primesc +1 caracter
-        displs[i] = offset;
-        offset += sendcounts[i];
-    }
-
-	//fiecare proces primeste nr de cuvinte din bucata lui
-    int local_n = sendcounts[rank];
-
-    vector<string> local_words(local_n);
-
-
-
-	//serializare pe rank 0 din string in char pentru MPI_Scatterv
-    vector<char> send_buffer;
-    vector<int> word_sizes;
-
-    if (rank == 0)
-    {
-        for (auto& w : allWords)
-        {
-            word_sizes.push_back(w.size());
-            send_buffer.insert(send_buffer.end(), w.begin(), w.end());
+        if (boundary >= (size_t)read_size) {
+            // nu am citit extra, procesam tot ce avem
+            end_idx = read_size;
         }
-    }
-
-
-    // fiec proces primeste dimensiunile cuvintelor lui
-    vector<int> local_word_sizes(local_n);
-    MPI_Scatterv(word_sizes.data(), sendcounts.data(), displs.data(),
-        MPI_INT, local_word_sizes.data(), local_n,
-        MPI_INT, 0, MPI_COMM_WORLD);
-
-    // calculam offset pentru caractere
-    //cate carac treb trimise fiec proces
-    vector<int> char_counts(size), char_displs(size);
-
-    if (rank == 0)
-    {
-        int char_offset = 0;
-        for (int i = 0; i < size; i++)
-        {
-            char_counts[i] = 0;
-            for (int j = displs[i]; j < displs[i] + sendcounts[i]; j++)
-                char_counts[i] += word_sizes[j];
-
-            char_displs[i] = char_offset;
-            char_offset += char_counts[i];
+        else {
+            if (isalpha((unsigned char)buffer[boundary])) {
+                // granita cade in mijlocul unui cuvant
+                // dam inapoi pana la inceputul lui si il lasam procesului urmator
+                size_t pos = boundary;
+                while (pos > start_idx && isalpha((unsigned char)buffer[pos - 1]))
+                    pos--;
+                end_idx = pos;
+            }
+            else {
+                // granita cade pe un separator, chunk-ul nostru e curat
+                end_idx = boundary;
+            }
         }
     }
 
+    // WORD COUNT LOCAL
+    unordered_map<string, int> freq;
+    string word;
 
-    //fiec proces primeste bucata lui de text
-    int local_char_count = 0;
-    for (int s : local_word_sizes)
-        local_char_count += s;
-
-    vector<char> local_chars(local_char_count);
-
-    MPI_Scatterv(send_buffer.data(), char_counts.data(), char_displs.data(),
-        MPI_CHAR, local_chars.data(), local_char_count,
-        MPI_CHAR, 0, MPI_COMM_WORLD);
-
-	// reconstruire cuvinte locale in stringuri
-    int pos = 0;
-    for (int i = 0; i < local_n; i++)
-    {
-        string w(local_chars.begin() + pos,
-            local_chars.begin() + pos + local_word_sizes[i]);
-        local_words[i] = w;
-        pos += local_word_sizes[i];
+    for (size_t i = start_idx; i < end_idx; i++) {
+        char nc = normalize_char(buffer[i]);
+        if (nc != '\0')
+            word += nc;     // continuam sa construim cuvantul
+        else
+            add_word(freq, word);  // am dat de separator, salvam cuvantul
     }
+    // salvam ultimul cuvant daca buffer-ul nu se termina cu separator
+    add_word(freq, word); 
 
-    
-
-    //frecventa locala
-    unordered_map<string, int> local_freq;
-
-    for (auto& w : local_words)
-        local_freq[w]++;
-
-    //serializare rezultate
+    // SERIALIZARE
+    // convertim map-ul local intr-un string de forma "cuvant count\n"
+    // ca sa il putem trimite prin MPI
     string serialized;
-    for (auto& p : local_freq)
-    {
+    serialized.reserve(freq.size() * 20);
+    for (auto& p : freq)
         serialized += p.first + " " + to_string(p.second) + "\n";
-    }
 
-    int local_size = serialized.size();
+    int serialized_size = (int)serialized.size();
 
-	//primeste rank 0 cat a calculat fiec proces
-    vector<int> recv_sizes(size);
-    MPI_Gather(&local_size, 1, MPI_INT, recv_sizes.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    vector<int> recv_displs(size);
-    string global_buffer;
 
-	//calculam displs pentru rezultate
-    if (rank == 0)
-    {
-        int offset2 = 0;
-        for (int i = 0; i < size; i++)
-        {
-            recv_displs[i] = offset2;
-            offset2 += recv_sizes[i];
+    // GATHER DIMENSIUNI
+    //colectam dimensiunile de la fiecare proces
+    // procesul 0 trebuie sa stie cat spatiu sa aloce pentru fiecare
+
+    vector<int> recvcounts(size);
+    MPI_Gather(&serialized_size, 1, MPI_INT,
+        recvcounts.data(), 1, MPI_INT,
+        0, MPI_COMM_WORLD);
+
+
+    // GATHER DATE 
+    vector<int> displs(size);
+    string global;
+
+    if (rank == 0) {
+        //calculam offset-ul fiecarui proces in buffer-ul global
+        int offset = 0;
+        for (int i = 0; i < size; i++) {
+            displs[i] = offset;
+            offset += recvcounts[i];
         }
-        global_buffer.resize(offset2);
+        global.resize(offset);
     }
 
-    MPI_Gatherv(serialized.data(), local_size, MPI_CHAR,
-        rank == 0 ? &global_buffer[0] : nullptr,
-        recv_sizes.data(), recv_displs.data(),
-        MPI_CHAR, 0, MPI_COMM_WORLD);
+    //fiecare proces trimite rezultatele sale la procesul 0
+    MPI_Gatherv(serialized.data(), serialized_size, MPI_CHAR,
+        rank == 0 ? &global[0] : nullptr,
+        recvcounts.data(), displs.data(), MPI_CHAR,
+        0, MPI_COMM_WORLD);
 
-	//combinare rezultate si sortare
-    if (rank == 0)
-    {
+    // REDUCERE FINALA (rank 0)
+    //parsam string-ul global si adunam frecventele pentru fiecare cuvant
+    if (rank == 0) {
         unordered_map<string, int> global_freq;
+        global_freq.reserve(100000);
 
-        string word;
-        int count;
         size_t i = 0;
+        while (i < global.size()) {
+            //citim cuvantul pana la spatiu
+            size_t word_start = i;
+            while (i < global.size() && global[i] != ' ') i++;
+            string w(global.begin() + word_start, global.begin() + i);
+            i++; // sarim spatiul
 
-        while (i < global_buffer.size())
-        {
-            word.clear();
+            // citim numarul pana la newline
+            int count = 0;
+            while (i < global.size() && global[i] != '\n')
+                count = count * 10 + (global[i++] - '0');
+            if (i < global.size()) i++; // skip newline
 
-            while (i < global_buffer.size() && global_buffer[i] != ' ')
-                word += global_buffer[i++];
-
-            i++;
-
-            count = 0;
-            while (i < global_buffer.size() && global_buffer[i] != '\n')
-                count = count * 10 + (global_buffer[i++] - '0');
-
-            i++;
-
-            global_freq[word] += count;
+            // adunam frecventa in map-ul global
+            if (!w.empty())
+                global_freq[w] += count;
         }
 
-        vector<pair<string, int>> words(global_freq.begin(), global_freq.end());
+        // sortam descrescator dupa frecventa
+        vector<pair<string, int>> v(global_freq.begin(), global_freq.end());
+        sort(v.begin(), v.end(),
+            [](auto& a, auto& b) { return a.second > b.second; });
 
-        int k = min(10, (int)words.size());
-        partial_sort(words.begin(), words.begin() + k, words.end(), cmp);
-
-        cout << "Top 10 cuvinte:\n";
-        for (int i = 0; i < k; i++)
-            cout << words[i].first << " : " << words[i].second << endl;
+        cout << "Cele mai frecvente 10 cuvinte:\n";
+        for (int i = 0; i < min(10, (int)v.size()); i++)
+            cout << v[i].first << " : " << v[i].second << "\n";
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
-    double end = MPI_Wtime();
+    double end_time = MPI_Wtime();
 
     if (rank == 0)
-        cout << "\nTimp MPI: " << (end - start) * 1000 << " ms\n";
+        cout << "\nTimp MPI: " << (end_time - start) * 1000 << " ms\n";
 
     MPI_Finalize();
     return 0;
