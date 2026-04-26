@@ -10,110 +10,103 @@
 using namespace std;
 using namespace std::chrono;
 
-// normalizare
-string normalize(const string& word)
-{
-    string result;
-    for (unsigned char c : word)
-    {
-        if (isalpha(c))
-            result += tolower(c);
-    }
-    return result;
-}
-
-// comparare pentru sortare
-bool cmp(const pair<string, int>& a, const pair<string, int>& b)
-{
-    return a.second > b.second;
-}
-
-// functie executata de fiecare thread
-void process_chunk(const vector<string>& words,
-    int start, int end,
+void process_chunk(const char* buf, size_t start, size_t end,
     unordered_map<string, int>& local_freq)
 {
-    for (int i = start; i < end; i++)
-    {
-        local_freq[words[i]]++;
+    string word;
+    word.reserve(32);
+
+    for (size_t i = start; i < end; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (isalpha(c)) {
+            word += tolower(c);
+        }
+        else if (!word.empty()) {
+            local_freq[word]++;
+            word.clear();
+        }
     }
+    if (!word.empty())
+        local_freq[word]++;
 }
 
 int main()
 {
-    ifstream file("D:/ADP/ProiectAPD/VariantaSecventiala/Alice_in_Wonderland_AllChapters.txt");
+    auto t_start = high_resolution_clock::now();
 
-    if (!file)
-    {
-        cout << "Eroare la fisier\n";
-        return 1;
-    }
+    // CITIRE INTEGRALA IN BUFFER BINAR
+    ifstream file("D:/ADP/ProiectAPD/VariantaSecventiala/Alice_in_Wonderland_x30mb.txt",
+        ios::binary | ios::ate);
+    if (!file) { cout << "Eroare la fisier\n"; return 1; }
 
-    vector<string> allWords;
-    string word;
+    size_t file_size = file.tellg();
+    file.seekg(0);
 
-    //citire + normalizare
-    while (file >> word)
-    {
-        word = normalize(word);
-        if (word != "")
-            allWords.push_back(word);
-    }
-
+    vector<char> buf(file_size + 1, '\0');
+    file.read(buf.data(), file_size);
     file.close();
 
-    auto start_time = high_resolution_clock::now();
+    // IMPARTIRE PE THREAD-URI CU GRANITE CORECTE
+    int num_threads = (int)thread::hardware_concurrency();
 
-    //numar thread-uri
-    int num_threads = thread::hardware_concurrency();
+    vector<size_t> starts(num_threads), ends(num_threads);
 
+    for (int i = 0; i < num_threads; i++) {
+        size_t s = (size_t)i * file_size / num_threads;
+        size_t e = (size_t)(i + 1) * file_size / num_threads;
+
+        // Ajusteaza start: sari cuvantul partial de la inceput
+        if (i != 0) {
+            while (s < file_size && isalpha((unsigned char)buf[s])) s++;
+            while (s < file_size && !isalpha((unsigned char)buf[s])) s++;
+        }
+
+        // Ajusteaza end: daca granita e in mijlocul unui cuvant, da inapoi
+        if (i != num_threads - 1) {
+            while (e > s && isalpha((unsigned char)buf[e])) e--;
+        }
+        else {
+            e = file_size;
+        }
+
+        starts[i] = s;
+        ends[i] = e;
+    }
+
+    // LANSARE THREAD-URI
     vector<thread> threads;
     vector<unordered_map<string, int>> local_maps(num_threads);
 
-    int chunk_size = allWords.size() / num_threads;
-
-    //creare thread-uri
-    for (int i = 0; i < num_threads; i++)
-    {
-        int start = i * chunk_size;
-        int end = (i == num_threads - 1) ? allWords.size() : start + chunk_size;
-
-		//porneste firul si calc frecv locala cu fctia process_chunk
+    for (int i = 0; i < num_threads; i++) {
         threads.emplace_back(process_chunk,
-			cref(allWords),     ///trimite vectorul normaliz ca ref constanta
-            start, end,         //intervalul
-			ref(local_maps[i]));    //trimite map-ul local ca referinta
+            buf.data(), starts[i], ends[i],
+            ref(local_maps[i]));
     }
 
-    //join thread-uri
-    for (auto& t : threads)
-        t.join();
+    for (auto& t : threads) t.join();
 
-    //reducere
+    // REDUCERE
     unordered_map<string, int> global_freq;
+    global_freq.reserve(1 << 17);
 
     for (int i = 0; i < num_threads; i++)
-    {
-        for (auto& p : local_maps[i])
-        {
-            global_freq[p.first] += p.second;
-        }
-    }
+        for (auto& [w, c] : local_maps[i])
+            global_freq[w] += c;
 
-    //sortare
+    // SORTARE SI AFISARE
     vector<pair<string, int>> words(global_freq.begin(), global_freq.end());
-    sort(words.begin(), words.end(), cmp);
+    sort(words.begin(), words.end(),
+        [](auto& a, auto& b) { return a.second > b.second; });
 
-    auto end_time = high_resolution_clock::now();
-    auto duration = duration_cast<milliseconds>(end_time - start_time);
+    auto t_end = high_resolution_clock::now();
+    auto duration = duration_cast<milliseconds>(t_end - t_start);
 
-    cout << "Top 10 cuvinte:\n";
-    for (int i = 0; i < 10 && i < words.size(); i++)
-    {
-        cout << words[i].first << " : " << words[i].second << endl;
-    }
+    cout << "Cele mai frecvente 10 cuvinte:\n";
+    for (int i = 0; i < 10 && i < (int)words.size(); i++)
+        cout << words[i].first << " : " << words[i].second << "\n";
 
     cout << "\nTimp Threads: " << duration.count() << " ms\n";
+    cout << "Threads folosite: " << num_threads << "\n";
 
     return 0;
 }
